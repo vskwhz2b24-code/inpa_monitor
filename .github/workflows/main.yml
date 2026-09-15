@@ -1,0 +1,178 @@
+name: Monitor inPA
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Scarica il repository
+        uses: actions/checkout@v4
+
+      - name: Controlla inPA e invia eventuale notifica
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          import sys
+          import requests
+          from bs4 import BeautifulSoup
+
+          URL = "https://www.inpa.gov.it/bandi-e-avvisi/dettaglio-bando-avviso/?concorso_id=64051e592a564f5fabce426c0816bb27"
+          STATE_FILE = "inpa_state.json"
+
+          headers = {
+              "User-Agent": "Mozilla/5.0 (compatible; inPA-Monitor/1.0)"
+          }
+
+          try:
+              response = requests.get(URL, headers=headers, timeout=30)
+              response.raise_for_status()
+          except Exception as e:
+              print(f"Errore nel collegamento a inPA: {e}")
+              sys.exit(1)
+
+          soup = BeautifulSoup(response.text, "html.parser")
+
+          # Estraiamo il testo della pagina.
+          text = soup.get_text("\n", strip=True)
+
+          # Conserviamo solo le parti che ci interessano:
+          # - aggiornamenti
+          # - pubblicazioni/allegati
+          relevant = []
+
+          for line in text.splitlines():
+              line = " ".join(line.split())
+
+              if not line:
+                  continue
+
+              if line.startswith("Aggiornamento del"):
+                  relevant.append(line)
+
+              elif "Pubblicato il" in line:
+                  relevant.append(line)
+
+          # Eliminiamo eventuali duplicati mantenendo l'ordine.
+          seen = set()
+          relevant_unique = []
+
+          for item in relevant:
+              if item not in seen:
+                  seen.add(item)
+                  relevant_unique.append(item)
+
+          snapshot = "\n".join(relevant_unique)
+          current_hash = hashlib.sha256(snapshot.encode("utf-8")).hexdigest()
+
+          old_hash = None
+
+          if os.path.exists(STATE_FILE):
+              try:
+                  with open(STATE_FILE, "r", encoding="utf-8") as f:
+                      old_hash = json.load(f).get("hash")
+              except Exception:
+                  pass
+
+          # Prima esecuzione: memorizziamo lo stato attuale
+          # senza notificare tutti gli aggiornamenti già esistenti.
+          if old_hash is None:
+              with open(STATE_FILE, "w", encoding="utf-8") as f:
+                  json.dump(
+                      {
+                          "hash": current_hash,
+                          "snapshot": snapshot
+                      },
+                      f,
+                      ensure_ascii=False,
+                      indent=2
+                  )
+
+              print("Prima esecuzione: stato iniziale salvato. Nessuna notifica.")
+              subprocess.run(["git", "config", "user.name", "inPA Monitor"])
+              subprocess.run(["git", "config", "user.email", "inpa-monitor@users.noreply.github.com"])
+              subprocess.run(["git", "add", STATE_FILE])
+              subprocess.run(["git", "commit", "-m", "Salva stato iniziale inPA"], check=False)
+              subprocess.run(["git", "push"], check=False)
+              sys.exit(0)
+
+          # Se non è cambiato nulla, non facciamo niente.
+          if current_hash == old_hash:
+              print("Nessuna novità su inPA.")
+              sys.exit(0)
+
+          # Troviamo cosa è comparso rispetto allo stato precedente.
+          old_snapshot = ""
+
+          try:
+              with open(STATE_FILE, "r", encoding="utf-8") as f:
+                  old_snapshot = json.load(f).get("snapshot", "")
+          except Exception:
+              pass
+
+          old_items = set(old_snapshot.splitlines())
+          new_items = [x for x in relevant_unique if x not in old_items]
+
+          if not new_items:
+              new_items = ["La pagina inPA è cambiata. Controlla la pagina per i dettagli."]
+
+          message = "🚨 NUOVO AGGIORNAMENTO INPA\n\n"
+          message += "RIPAM Piccoli Comuni\n\n"
+
+          for item in new_items[:15]:
+              message += "📌 " + item + "\n"
+
+          if len(new_items) > 15:
+              message += f"\n...e altri {len(new_items) - 15} elementi.\n"
+
+          message += f"\n🔗 {URL}"
+
+          token = os.environ["TELEGRAM_BOT_TOKEN"]
+          chat_id = os.environ["TELEGRAM_CHAT_ID"]
+
+          telegram_url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+          telegram_response = requests.post(
+              telegram_url,
+              data={
+                  "chat_id": chat_id,
+                  "text": message
+              },
+              timeout=30
+          )
+
+          telegram_response.raise_for_status()
+
+          print("Notifica Telegram inviata.")
+
+          # Salviamo il nuovo stato.
+          with open(STATE_FILE, "w", encoding="utf-8") as f:
+              json.dump(
+                  {
+                      "hash": current_hash,
+                      "snapshot": snapshot
+                  },
+                  f,
+                  ensure_ascii=False,
+                  indent=2
+              )
+
+          subprocess.run(["git", "config", "user.name", "inPA Monitor"])
+          subprocess.run(["git", "config", "user.email", "inpa-monitor@users.noreply.github.com"])
+          subprocess.run(["git", "add", STATE_FILE])
+          subprocess.run(["git", "commit", "-m", "Aggiorna stato monitor inPA"], check=False)
+          subprocess.run(["git", "push"], check=False)
+          PY
