@@ -15,7 +15,8 @@ jobs:
     steps:
       - name: Scarica il repository
         uses: actions/checkout@v4
-
+      - name: Installa dipendenze
+        run: pip install requests beautifulsoup4
       - name: Controlla inPA e invia eventuale notifica
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
